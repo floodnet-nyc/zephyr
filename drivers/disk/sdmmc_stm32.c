@@ -168,6 +168,7 @@ DEFINE_HAL_CALLBACK(HAL_SD_TxCpltCallback);
 DEFINE_HAL_CALLBACK(HAL_SD_RxCpltCallback);
 DEFINE_HAL_CALLBACK(HAL_SD_ErrorCallback);
 #endif
+int stm32_sdmmc_pm_action(const struct device *dev, enum pm_device_action action);
 
 static int stm32_sdmmc_clock_enable(struct stm32_sdmmc_priv *priv)
 {
@@ -366,142 +367,63 @@ static int stm32_sdmmc_card_detect_uninit(struct stm32_sdmmc_priv *priv);
 #endif /* !CONFIG_SDMMC_STM32_EMMC */
 
 static bool stm32_sdmmc_card_present(struct stm32_sdmmc_priv *priv);
+static int stm32_sdmmc_resume(const struct device *dev);
+static int stm32_sdmmc_suspend(const struct device *dev);
+
+static void stm32_sdmmc_pm_policy_state_lock_get(const struct device *dev);
+static void stm32_sdmmc_pm_policy_state_lock_put(const struct device *dev);
 
 static int stm32_sdmmc_access_init(struct disk_info *disk)
 {
 	const struct device *dev = disk->dev;
 	struct stm32_sdmmc_priv *priv = dev->data;
-	HAL_StatusTypeDef hal_ret;
 	int err;
 
-#ifdef CONFIG_PM_DEVICE_RUNTIME
-	pm_device_runtime_get(dev);
-#endif
-	err = stm32_sdmmc_pwr_on(priv);
-	if (err) {
-		return -EIO;
-	}
-
-	/* Configure dt provided device signals when available */
-	err = pinctrl_apply_state(priv->pcfg, PINCTRL_STATE_DEFAULT);
-	if (err < 0) {
-		stm32_sdmmc_pwr_off(priv);
-		return err;
-	}
-
+	/* First do things that are independent of power */
 #if !defined(CONFIG_SDMMC_STM32_EMMC)
 	err = stm32_sdmmc_card_detect_init(priv);
 	if (err) {
-		stm32_sdmmc_pwr_off(priv);
+		LOG_ERR("Card detect failed with err: %d", err);
 		return err;
 	}
 #endif
 
 	if (!stm32_sdmmc_card_present(priv)) {
+		LOG_ERR("No media. Card is not present.");
 		priv->status = DISK_STATUS_NOMEDIA;
-		err = -ENODEV;
-		goto error;
+		return -ENODEV;
 	}
-
 	priv->status = DISK_STATUS_UNINIT;
 
-#if STM32_SDMMC_USE_DMA
-	err = stm32_sdmmc_dma_init(priv);
-	if (err) {
-		LOG_ERR("DMA init failed");
-		goto error;
-	}
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	pm_device_runtime_enable(dev);
+	pm_device_runtime_get(dev);
+#else 
+	err = stm32_sdmmc_resume(dev);
 #endif
-
-	err = stm32_sdmmc_clock_enable(priv);
-	if (err) {
-		LOG_ERR("failed to init clocks");
-		goto error;
-	}
-
-	err = reset_line_toggle_dt(&priv->reset);
-	if (err) {
-		LOG_ERR("failed to reset peripheral");
-		goto error;
-	}
-
-#ifdef CONFIG_SDMMC_STM32_EMMC
-	hal_ret = HAL_MMC_Init(&priv->hsd);
-#else
-	hal_ret = HAL_SD_Init(&priv->hsd);
-#endif
-	if (hal_ret != HAL_OK) {
-		LOG_ERR("failed to init stm32_sdmmc (ErrorCode 0x%X)", priv->hsd.ErrorCode);
-		err = -EIO;
-		goto error;
-	}
-
-	if (SDMMC_BUS_WIDTH != SDMMC_BUS_WIDE_1B) {
-		priv->hsd.Init.BusWide = SDMMC_BUS_WIDTH;
-#ifdef CONFIG_SDMMC_STM32_EMMC
-		hal_ret = HAL_MMC_ConfigWideBusOperation(&priv->hsd, priv->hsd.Init.BusWide);
-#else
-		hal_ret = HAL_SD_ConfigWideBusOperation(&priv->hsd, priv->hsd.Init.BusWide);
-#endif
-		if (hal_ret != HAL_OK) {
-			LOG_ERR("failed to configure wide bus operation (ErrorCode 0x%X)",
-				priv->hsd.ErrorCode);
-			err = -EIO;
-			goto error;
-		}
-	}
-
-#ifdef CONFIG_SDMMC_STM32_HWFC
-	stm32_sdmmc_fc_enable(priv);
-#endif
-
-	priv->status = DISK_STATUS_OK;
-	return 0;
-error:
-#if !defined(CONFIG_SDMMC_STM32_EMMC)
-	stm32_sdmmc_card_detect_uninit(priv);
-#endif /* !CONFIG_SDMMC_STM32_EMMC */
-	stm32_sdmmc_pwr_off(priv);
+	
 	return err;
 }
 
 static int stm32_sdmmc_access_deinit(const struct device *dev)
 {
-	HAL_StatusTypeDef hal_ret;
 	struct stm32_sdmmc_priv *priv = dev->data;
+	int err = 0;
 
-#if STM32_SDMMC_USE_DMA
-	int err;
-
-	err = stm32_sdmmc_dma_deinit(priv);
-	if (err) {
-		LOG_ERR("DMA deinit failed");
-		return err;
-	}
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	//pm_device_runtime_disable(dev);
+	pm_device_runtime_put(dev);
+#else 
+	err = stm32_sdmmc_suspend(dev);
 #endif
-
-#if defined(CONFIG_SDMMC_STM32_EMMC)
-	hal_ret = HAL_MMC_DeInit(&priv->hsd);
-#else
-	hal_ret = HAL_SD_DeInit(&priv->hsd);
-	stm32_sdmmc_clock_disable(priv);
-#endif
-	if (hal_ret != HAL_OK) {
-		LOG_ERR("failed to deinit stm32_sdmmc (ErrorCode 0x%X)", priv->hsd.ErrorCode);
-		return -EIO;
-	}
 
 #if !defined(CONFIG_SDMMC_STM32_EMMC)
 	stm32_sdmmc_card_detect_uninit(priv);
-#endif
-	stm32_sdmmc_pwr_off(priv);
-
+#endif /* !CONFIG_SDMMC_STM32_EMMC */
+		
 	priv->status = DISK_STATUS_UNINIT;
 
-#ifdef CONFIG_PM_DEVICE_RUNTIME
-	pm_device_runtime_put(dev);
-#endif
-	return 0;
+	return err;
 }
 
 static int stm32_sdmmc_access_status(struct disk_info *disk)
@@ -560,7 +482,7 @@ static int stm32_sdmmc_access_read(struct disk_info *disk, uint8_t *data_buf,
 	int err;
 
 	k_sem_take(&priv->thread_lock, K_FOREVER);
-	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	stm32_sdmmc_pm_policy_state_lock_get(dev);
 
 #if STM32_SDMMC_USE_DMA_SHARED
 	/* Initialise the shared DMA channel for the current direction */
@@ -595,7 +517,7 @@ static int stm32_sdmmc_access_read(struct disk_info *disk, uint8_t *data_buf,
 	}
 
 end:
-	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	stm32_sdmmc_pm_policy_state_lock_put(dev);
 	k_sem_give(&priv->thread_lock);
 	return err;
 }
@@ -641,7 +563,7 @@ static int stm32_sdmmc_access_write(struct disk_info *disk,
 	int err;
 
 	k_sem_take(&priv->thread_lock, K_FOREVER);
-	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	stm32_sdmmc_pm_policy_state_lock_get(dev);
 
 #if STM32_SDMMC_USE_DMA_SHARED
 	/* Initialise the shared DMA channel for the current direction */
@@ -677,7 +599,7 @@ static int stm32_sdmmc_access_write(struct disk_info *disk,
 	}
 
 end:
-	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	stm32_sdmmc_pm_policy_state_lock_put(dev);
 	k_sem_give(&priv->thread_lock);
 	return err;
 }
@@ -881,8 +803,8 @@ static void stm32_sdmmc_pwr_off(struct stm32_sdmmc_priv *priv)
 
 	/* PINCTRL sleep mode when powered down */
 	ret = pinctrl_apply_state(priv->pcfg, PINCTRL_STATE_SLEEP);
-	if (ret != 0 && ret != ENOTSUP) {
-		LOG_WRN("Failed to configure pins for sleep (%d)", ret);
+	if (ret != 0 && ret != -ENOTSUP) {
+		LOG_WRN_ONCE("Failed to configure pins for sleep (%d)", ret);
 	}
 	gpio_pin_configure_dt(&priv->pe, GPIO_OUTPUT_INACTIVE);
 }
@@ -912,6 +834,13 @@ static int disk_stm32_sdmmc_init(const struct device *dev)
 	k_work_init(&priv->work, stm32_sdmmc_cd_handler);
 #endif
 
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	//int err = pm_device_runtime_enable(dev);
+	//if (err) {
+	//	return err;
+	//}
+#endif
+
 	/* Ensure off by default */
 	stm32_sdmmc_pwr_off(priv);
 
@@ -933,19 +862,39 @@ void stm32_sdmmc_get_card_csd(const struct device *dev, uint32_t csd[4])
 	memcpy(csd, &priv->hsd.CSD, sizeof(priv->hsd.CSD));
 }
 
-static int stm32_sdmmc_activate(const struct device *dev)
-{
+static void stm32_sdmmc_prevent_system_sleep(void) {
 	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+}
 
+static void stm32_sdmmc_allow_system_sleep(void) {
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+}
+
+static void stm32_sdmmc_pm_policy_state_lock_get(const struct device *dev)
+{
+	stm32_sdmmc_prevent_system_sleep();
+	//pm_device_runtime_get(dev);
+}
+
+static void stm32_sdmmc_pm_policy_state_lock_put(const struct device *dev)
+{
+	//pm_device_runtime_put(dev);
+	stm32_sdmmc_allow_system_sleep();
+}
+
+static int stm32_sdmmc_resume(const struct device *dev)
+{
 	struct stm32_sdmmc_priv *priv = dev->data;
+	HAL_StatusTypeDef hal_ret;
 	int err = 0;
 
 	/* serialize against read/write */
 	k_sem_take(&priv->thread_lock, K_FOREVER);
 
-	/* Power rail first (if present) */
+	/* Power on the peripheral */
 	err = stm32_sdmmc_pwr_on(priv);
 	if (err) {
+		err = -EIO;
 		goto out;
 	}
 
@@ -989,6 +938,21 @@ static int stm32_sdmmc_activate(const struct device *dev)
 		goto out_dma_deinit;
 	}
 
+	if (SDMMC_BUS_WIDTH != SDMMC_BUS_WIDE_1B) {
+		priv->hsd.Init.BusWide = SDMMC_BUS_WIDTH;
+#ifdef CONFIG_SDMMC_STM32_EMMC
+		hal_ret = HAL_MMC_ConfigWideBusOperation(&priv->hsd, priv->hsd.Init.BusWide);
+#else
+		hal_ret = HAL_SD_ConfigWideBusOperation(&priv->hsd, priv->hsd.Init.BusWide);
+#endif
+		if (hal_ret != HAL_OK) {
+			LOG_ERR("failed to configure wide bus operation (ErrorCode 0x%X)",
+				priv->hsd.ErrorCode);
+			err = -EIO;
+			goto out_dma_deinit;
+		}
+	}
+
 	/* IRQ last */
 	priv->irq_config(dev);
 	irq_enable(DT_INST_IRQN(0));
@@ -997,6 +961,7 @@ static int stm32_sdmmc_activate(const struct device *dev)
 	stm32_sdmmc_fc_enable(priv);
 #endif
 
+	priv->status = DISK_STATUS_OK;
 	goto out; /* success */
 
 out_dma_deinit:
@@ -1011,14 +976,11 @@ out_pwr_off:
 	stm32_sdmmc_pwr_off(priv);
 out:
 	k_sem_give(&priv->thread_lock);
-	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 	return err;
 }
 
 static int stm32_sdmmc_suspend(const struct device *dev)
 {
-	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
-
 	struct stm32_sdmmc_priv *priv = dev->data;
 
 	/* serialize against read/write */
@@ -1042,45 +1004,39 @@ static int stm32_sdmmc_suspend(const struct device *dev)
 
 	/* Gate SDMMC clocks and reset peripheral to kill any latent state */
 	(void)stm32_sdmmc_clock_disable(priv);
-	__HAL_RCC_SDMMC1_FORCE_RESET();
-	__HAL_RCC_SDMMC1_RELEASE_RESET();
+
+	/* Force reset */
+	(void)reset_line_toggle_dt(&priv->reset);
 
 	/* Apply sleep/low-leakage pin state before removing power */
 	int ret = pinctrl_apply_state(priv->pcfg, PINCTRL_STATE_SLEEP);
 	if (ret && ret != -ENOTSUP) {
-		LOG_WRN("sleep pinctrl failed: %d", ret);
+		LOG_WRN_ONCE("sleep pinctrl failed: %d", ret);
 	}
 
 	/* Optionally cut card power (if you wired pwr_gpios) */
 	stm32_sdmmc_pwr_off(priv);
 
-	/* If HSI48 was used only for SDMMC, system PM may turn it off later.
-	   If you want to force it off right here (safe if USB not used): */
-#if defined(LL_RCC_HSI48_IsReady)
-	if (LL_RCC_HSI48_IsReady()) {
-		LL_RCC_HSI48_Disable();
-		while (LL_RCC_HSI48_IsReady()) {
-			;
-		}
-	}
-#endif
-
 	k_sem_give(&priv->thread_lock);
-	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 	return 0;
 }
 
-#ifdef CONFIG_PM_DEVICE
 int stm32_sdmmc_pm_action(const struct device *dev, enum pm_device_action action)
 {
 	int err;
 
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
-		err = stm32_sdmmc_activate(dev);
+		stm32_sdmmc_prevent_system_sleep();
+		err = stm32_sdmmc_resume(dev);
+		if (err) {
+			/* allow sleep if resume fails */
+			stm32_sdmmc_allow_system_sleep();
+		}
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
 		err = stm32_sdmmc_suspend(dev);
+		stm32_sdmmc_allow_system_sleep();
 		break;
 	default:
 		return -ENOTSUP;
@@ -1088,7 +1044,6 @@ int stm32_sdmmc_pm_action(const struct device *dev, enum pm_device_action action
 
 	return err;
 }
-#endif
 
 #if DT_NODE_HAS_STATUS_OKAY(DT_DRV_INST(0))
 
