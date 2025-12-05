@@ -209,11 +209,20 @@ static int stm32_sdmmc_clock_enable(struct stm32_sdmmc_priv *priv)
 #if !defined(CONFIG_SDMMC_STM32_EMMC)
 static int stm32_sdmmc_clock_disable(struct stm32_sdmmc_priv *priv)
 {
+	int ret;
 	const struct device *clock;
 
 	clock = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
 
-	return clock_control_off(clock, (clock_control_subsys_t)&priv->pclken[0]);
+	/* Gate APB/AHB peripheral clock */
+	ret = clock_control_off(clock, (clock_control_subsys_t)&priv->pclken[0]);
+
+	/* Also gate the 48MHz domain if we configured it in _enable() */
+	if (DT_INST_NUM_CLOCKS(0) > 1) {
+		int ret2 = clock_control_off(clock, (clock_control_subsys_t)&priv->pclken[1]);
+		if (ret == 0) ret = ret2;
+	}
+	return ret;
 }
 #endif
 
@@ -398,10 +407,10 @@ static int stm32_sdmmc_access_init(struct disk_info *disk)
 #ifdef CONFIG_PM_DEVICE_RUNTIME
 	pm_device_runtime_enable(dev);
 	pm_device_runtime_get(dev);
-#else 
+#else
 	err = stm32_sdmmc_resume(dev);
 #endif
-	
+
 	return err;
 }
 
@@ -411,16 +420,16 @@ static int stm32_sdmmc_access_deinit(const struct device *dev)
 	int err = 0;
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
-	//pm_device_runtime_disable(dev);
+	pm_device_runtime_disable(dev);
 	pm_device_runtime_put(dev);
-#else 
+#else
 	err = stm32_sdmmc_suspend(dev);
 #endif
 
 #if !defined(CONFIG_SDMMC_STM32_EMMC)
 	stm32_sdmmc_card_detect_uninit(priv);
 #endif /* !CONFIG_SDMMC_STM32_EMMC */
-		
+
 	priv->status = DISK_STATUS_UNINIT;
 
 	return err;
@@ -824,7 +833,7 @@ static int disk_stm32_sdmmc_init(const struct device *dev)
 		return -ENODEV;
 	}
 
-	priv->irq_config(dev);
+	//priv->irq_config(dev);
 
 	/* Initialize semaphores */
 	k_sem_init(&priv->thread_lock, 1, 1);
@@ -835,12 +844,8 @@ static int disk_stm32_sdmmc_init(const struct device *dev)
 #endif
 
 #ifdef CONFIG_PM_DEVICE_RUNTIME
-	//int err = pm_device_runtime_enable(dev);
-	//if (err) {
-	//	return err;
-	//}
+	pm_device_runtime_enable(dev);
 #endif
-
 	/* Ensure off by default */
 	stm32_sdmmc_pwr_off(priv);
 
@@ -873,12 +878,10 @@ static void stm32_sdmmc_allow_system_sleep(void) {
 static void stm32_sdmmc_pm_policy_state_lock_get(const struct device *dev)
 {
 	stm32_sdmmc_prevent_system_sleep();
-	//pm_device_runtime_get(dev);
 }
 
 static void stm32_sdmmc_pm_policy_state_lock_put(const struct device *dev)
 {
-	//pm_device_runtime_put(dev);
 	stm32_sdmmc_allow_system_sleep();
 }
 
@@ -1008,6 +1011,7 @@ static int stm32_sdmmc_suspend(const struct device *dev)
 	/* Force reset */
 	(void)reset_line_toggle_dt(&priv->reset);
 
+
 	/* Apply sleep/low-leakage pin state before removing power */
 	int ret = pinctrl_apply_state(priv->pcfg, PINCTRL_STATE_SLEEP);
 	if (ret && ret != -ENOTSUP) {
@@ -1029,10 +1033,10 @@ int stm32_sdmmc_pm_action(const struct device *dev, enum pm_device_action action
 	case PM_DEVICE_ACTION_RESUME:
 		stm32_sdmmc_prevent_system_sleep();
 		err = stm32_sdmmc_resume(dev);
-		if (err) {
-			/* allow sleep if resume fails */
-			stm32_sdmmc_allow_system_sleep();
-		}
+		//if (err) {
+		//	/* allow sleep if resume fails */
+		//	stm32_sdmmc_allow_system_sleep();
+		//}
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
 		err = stm32_sdmmc_suspend(dev);
